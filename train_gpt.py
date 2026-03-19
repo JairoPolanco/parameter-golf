@@ -61,10 +61,14 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
+    num_heads = int(os.environ.get("NUM_HEADS", 12))
+    stem_layers = int(os.environ.get("STEM_LAYERS", 2))
+    n_loops = int(os.environ.get("N_LOOPS", 5))
+    crown_layers = int(os.environ.get("CROWN_LAYERS", 1))
+    workspace_tokens = int(os.environ.get("WORKSPACE_TOKENS", 4))
+    workspace_diversity_weight = float(os.environ.get("WORKSPACE_DIVERSITY_WEIGHT", "0.001"))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -552,6 +556,22 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def _workspace_causal_mask(full_len: int, workspace_len: int, device: torch.device) -> Tensor:
+    """Float additive bias mask for workspace-augmented causal attention.
+    Shape: (1, 1, full_len, full_len). Allowed=0.0, masked=-inf.
+    Workspace rows attend to all. Sequence rows attend to workspace + causal past.
+    """
+    mask = torch.full((full_len, full_len), float("-inf"), device=device)
+    mask[:workspace_len, :] = 0.0
+    mask[workspace_len:, :workspace_len] = 0.0
+    T = full_len - workspace_len
+    causal = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool))
+    mask[workspace_len:, workspace_len:] = torch.where(
+        causal, torch.zeros(T, T, device=device), torch.full((T, T), float("-inf"), device=device)
+    )
+    return mask.unsqueeze(0).unsqueeze(0)   # (1, 1, full_len, full_len)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -580,7 +600,7 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, attn_mask: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -591,14 +611,20 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if attn_mask is not None:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask.to(dtype=q.dtype),
+                is_causal=False,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -636,10 +662,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, attn_mask: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), attn_mask=attn_mask)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -649,7 +675,10 @@ class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,
+        stem_layers: int,
+        n_loops: int,
+        crown_layers: int,
+        workspace_tokens: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -659,6 +688,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        workspace_diversity_weight: float,
+        seq_len: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,28 +697,39 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.workspace_tokens = workspace_tokens
+        self.n_loops = n_loops
+        self.workspace_diversity_weight = workspace_diversity_weight
+
+        def _block():
+            return Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
-        )
+        self.stem = nn.ModuleList([_block() for _ in range(stem_layers)])
+        self.recurrent_block = _block()
+        self.crown = nn.ModuleList([_block() for _ in range(crown_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+
+        # WRT-Omega learnable additions
+        W = workspace_tokens
+        self.workspace_init = nn.Parameter(torch.randn(W, model_dim) * 0.02) if W > 0 else None
+        self.loop_pos_emb = nn.Embedding(max(1, n_loops), model_dim) if W > 0 else None
+        if self.loop_pos_emb is not None:
+            nn.init.normal_(self.loop_pos_emb.weight, std=0.02)
+        self.inject_scales = nn.Parameter(torch.full((n_loops,), 0.1))
+        self.skip_weight = nn.Parameter(torch.tensor(0.0))
+
+        # Pre-build workspace attention mask (float additive bias, non-persistent)
+        if W > 0:
+            full_len = W + seq_len
+            mask = _workspace_causal_mask(full_len, W, device=torch.device("cpu"))
+            self.register_buffer("_workspace_mask", mask, persistent=False)
+        else:
+            self._workspace_mask = None
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -698,30 +740,58 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
+        B, T = input_ids.shape
+        W = self.workspace_tokens
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = F.rms_norm(self.tok_emb(input_ids), (self.tok_emb.embedding_dim,))
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        if W > 0:
+            ws = self.workspace_init.unsqueeze(0).expand(B, -1, -1).to(dtype=x.dtype)
+            h = torch.cat([ws, x], dim=1)              # (B, W+T, d)
+            x0 = h                                      # resid_mix anchor
+            mask = self._workspace_mask.to(device=h.device)
+        else:
+            h = x
+            x0 = x
+            mask = None
+
+        for block in self.stem:
+            h = block(h, x0, attn_mask=mask)
+        x_stem = h
+
+        x_tok = x0[:, W:, :] if W > 0 else x0         # original seq embed for injection
+        for k in range(self.n_loops):
+            if W > 0:
+                lpe = self.loop_pos_emb.weight[k].to(dtype=h.dtype)
+                h_ws = h[:, :W, :] + lpe
+                h_seq = h[:, W:, :] + self.inject_scales[k].to(dtype=h.dtype) * x_tok
+                h = torch.cat([h_ws, h_seq], dim=1)
+            else:
+                h = h + self.inject_scales[k].to(dtype=h.dtype) * x_tok
+            h = self.recurrent_block(h, x0, attn_mask=mask)
+
+        div_loss = h.new_zeros(())
+        if W > 0 and self.workspace_diversity_weight > 0.0:
+            ws_out = h[:, :W, :].mean(0).float()
+            ws_n = F.normalize(ws_out, dim=-1)
+            gram = ws_n @ ws_n.T
+            eye = torch.eye(W, device=gram.device, dtype=gram.dtype)
+            div_loss = ((gram - eye) ** 2 * (1.0 - eye)).mean()
+
+        h = h + self.skip_weight.to(dtype=h.dtype) * x_stem
+        for block in self.crown:
+            h = block(h, x0, attn_mask=mask)
+
+        h_seq = h[:, W:, :] if W > 0 else h
+        x_out = self.final_norm(h_seq).reshape(-1, h_seq.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x_out, self.tok_emb.weight)
         else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(x_out)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        return ce_loss + self.workspace_diversity_weight * div_loss
 
 
 # -----------------------------
@@ -825,7 +895,10 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
+        stem_layers=args.stem_layers,
+        n_loops=args.n_loops,
+        crown_layers=args.crown_layers,
+        workspace_tokens=args.workspace_tokens,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -835,6 +908,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        workspace_diversity_weight=args.workspace_diversity_weight,
+        seq_len=args.train_seq_len,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -848,7 +923,11 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = (
+        list(base_model.stem.named_parameters()) +
+        list(base_model.recurrent_block.named_parameters()) +
+        list(base_model.crown.named_parameters())
+    )
     matrix_params = [
         p
         for name, p in block_named_params
@@ -859,8 +938,12 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    # WRT-Omega top-level params: 2D matrices → Muon, scalars → Adam
+    if base_model.workspace_tokens > 0:
+        matrix_params.append(base_model.workspace_init)
+        matrix_params.append(base_model.loop_pos_emb.weight)
+    scalar_params.append(base_model.inject_scales)
+    scalar_params.append(base_model.skip_weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],

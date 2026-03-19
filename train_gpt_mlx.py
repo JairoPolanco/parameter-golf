@@ -65,9 +65,13 @@ class Hyperparameters:
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
-    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 768))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 12))
+    stem_layers: int = int(os.environ.get("STEM_LAYERS", 2))
+    n_loops: int = int(os.environ.get("N_LOOPS", 5))
+    crown_layers: int = int(os.environ.get("CROWN_LAYERS", 1))
+    workspace_tokens: int = int(os.environ.get("WORKSPACE_TOKENS", 4))
+    workspace_diversity_weight: float = float(os.environ.get("WORKSPACE_DIVERSITY_WEIGHT", "0.001"))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -186,6 +190,20 @@ def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.ar
     if transposed:
         x = x.T
     return x.astype(g.dtype)
+
+
+def _workspace_causal_mask(full_len: int, workspace_len: int) -> mx.array:
+    """Float additive bias mask for workspace-augmented causal attention.
+    Shape: (1, 1, full_len, full_len). Allowed=0.0, masked=-inf.
+    Workspace rows attend to all. Sequence rows attend to workspace + causal past.
+    """
+    mask_np = np.full((full_len, full_len), float("-inf"), dtype=np.float32)
+    mask_np[:workspace_len, :] = 0.0
+    mask_np[workspace_len:, :workspace_len] = 0.0
+    T = full_len - workspace_len
+    causal = np.tril(np.ones((T, T), dtype=np.float32))
+    mask_np[workspace_len:, workspace_len:] = np.where(causal, 0.0, float("-inf"))
+    return mx.array(mask_np[None, None, :, :])  # (1, 1, full_len, full_len)
 
 
 def load_data_shard(path: Path) -> np.ndarray:
@@ -320,7 +338,7 @@ class CausalSelfAttention(nn.Module):
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, attn_mask: mx.array | None = None) -> mx.array:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -329,7 +347,10 @@ class CausalSelfAttention(nn.Module):
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
-        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+        if attn_mask is not None:
+            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=attn_mask.astype(q.dtype))
+        else:
+            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -366,41 +387,66 @@ class Block(nn.Module):
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, attn_mask: mx.array | None = None) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), attn_mask=attn_mask)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
 class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+    def __init__(
+        self,
+        vocab_size: int,
+        stem_layers: int,
+        n_loops: int,
+        crown_layers: int,
+        workspace_tokens: int,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        logit_chunk_tokens: int,
+        logit_softcap: float,
+        rope_base: float,
+        tied_embed_init_std: float,
+        qk_gain_init: float,
+        workspace_diversity_weight: float,
+        seq_len: int,
+    ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.workspace_tokens = workspace_tokens
+        self.n_loops = n_loops
+        self.workspace_diversity_weight = workspace_diversity_weight
+
+        def _block():
+            return Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
-        ]
+        self.stem = [_block() for _ in range(stem_layers)]
+        self.recurrent_block = _block()
+        self.crown = [_block() for _ in range(crown_layers)]
         self.final_norm = RMSNormNoWeight()
 
-        for b in self.blocks:
+        # WRT-Omega learnable additions
+        W = workspace_tokens
+        self.workspace_init = mx.random.normal((W, dim), dtype=mx.float32) * 0.02 if W > 0 else None
+        self.loop_pos_emb = nn.Embedding(max(1, n_loops), dim) if W > 0 else None
+        if self.loop_pos_emb is not None:
+            self.loop_pos_emb.weight = mx.random.normal(self.loop_pos_emb.weight.shape, dtype=mx.float32) * 0.02
+        self.inject_scales = mx.full((n_loops,), 0.1, dtype=mx.float32)
+        self.skip_weight = mx.array(0.0, dtype=mx.float32)
+        # Workspace attention mask (stored as mx.array; not updated by optimizer)
+        self.ws_mask = _workspace_causal_mask(W + seq_len, W) if W > 0 else None
+
+        # Zero-init output projections
+        for b in self.stem + [self.recurrent_block] + self.crown:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         self.tok_emb.weight = (
@@ -411,32 +457,65 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def _forward_hidden(self, input_ids: mx.array) -> tuple[mx.array, mx.array]:
+        B, T = input_ids.shape
+        W = self.workspace_tokens
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
-        x0 = x
-        skips: list[mx.array] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-        return self.final_norm(x)
+        if W > 0:
+            ws = mx.broadcast_to(self.workspace_init.astype(x.dtype)[None, :, :], (B, W, x.shape[-1]))
+            h = mx.concatenate([ws, x], axis=1)   # (B, W+T, d)
+            x0 = h
+            mask = self.ws_mask.astype(x.dtype)
+        else:
+            h = x
+            x0 = x
+            mask = None
+
+        for block in self.stem:
+            h = block(h, x0, attn_mask=mask)
+        x_stem = h
+
+        x_tok = x0[:, W:, :] if W > 0 else x0
+        for k in range(self.n_loops):
+            if W > 0:
+                lpe = self.loop_pos_emb.weight[k].astype(h.dtype)
+                h_ws = h[:, :W, :] + lpe
+                h_seq = h[:, W:, :] + self.inject_scales[k].astype(h.dtype) * x_tok
+                h = mx.concatenate([h_ws, h_seq], axis=1)
+            else:
+                h = h + self.inject_scales[k].astype(h.dtype) * x_tok
+            h = self.recurrent_block(h, x0, attn_mask=mask)
+
+        div_loss = mx.array(0.0, dtype=mx.float32)
+        if W > 0 and self.workspace_diversity_weight > 0.0:
+            ws_out = h[:, :W, :].mean(axis=0).astype(mx.float32)  # (W, d)
+            norms = mx.sqrt(mx.sum(ws_out * ws_out, axis=-1, keepdims=True) + 1e-6)
+            ws_n = ws_out / norms
+            gram = ws_n @ ws_n.T  # (W, W)
+            eye = mx.eye(W)
+            div_loss = mx.mean((gram - eye) ** 2 * (1.0 - eye))
+
+        h = h + self.skip_weight.astype(h.dtype) * x_stem
+        for block in self.crown:
+            h = block(h, x0, attn_mask=mask)
+
+        h_seq = h[:, W:, :] if W > 0 else h
+        return self.final_norm(h_seq), div_loss
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        h_seq, _ = self._forward_hidden(input_ids)
+        return h_seq
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        x, div_loss = self._forward_hidden(input_ids)
+        x = x.reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
             logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+            ce_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+            return ce_loss + self.workspace_diversity_weight * div_loss
 
         loss_sum = mx.array(0.0, dtype=mx.float32)
         n = int(x.shape[0])
@@ -445,7 +524,7 @@ class GPT(nn.Module):
             logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
             logits = self.softcap(logits_proj)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
-        return loss_sum / float(n)
+        return loss_sum / float(n) + self.workspace_diversity_weight * div_loss
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -487,16 +566,27 @@ class SplitOptimizers:
         self.args = args
         params = dict(tree_flatten(model.parameters()))
         self.embed_key = "tok_emb.weight"
+        block_prefixes = ("stem.", "recurrent_block.", "crown.")
         self.matrix_keys = [
-            k
-            for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            k for k, p in params.items()
+            if any(k.startswith(prefix) for prefix in block_prefixes)
+            and p.ndim == 2
+            and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
+        # WRT-Omega top-level 2D params -> Muon
+        if "workspace_init" in params and params["workspace_init"].ndim == 2:
+            self.matrix_keys.append("workspace_init")
+        if "loop_pos_emb.weight" in params:
+            self.matrix_keys.append("loop_pos_emb.weight")
         self.scalar_keys = [
-            k
-            for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            k for k, p in params.items()
+            if any(k.startswith(prefix) for prefix in block_prefixes)
+            and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS))
         ]
+        # WRT-Omega scalars -> Adam
+        for k in ("inject_scales", "skip_weight"):
+            if k in params:
+                self.scalar_keys.append(k)
 
         self.muon = Muon(self.matrix_keys, params, args)
         self.adam_embed = optim.Adam(
@@ -875,7 +965,10 @@ def main() -> None:
     # ==============================================================================
     model = GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
+        stem_layers=args.stem_layers,
+        n_loops=args.n_loops,
+        crown_layers=args.crown_layers,
+        workspace_tokens=args.workspace_tokens,
         dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -885,6 +978,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        workspace_diversity_weight=args.workspace_diversity_weight,
+        seq_len=args.train_seq_len,
     )
     opt = SplitOptimizers(model, args)
 
@@ -920,7 +1015,8 @@ def main() -> None:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
-        f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
+        f"model_params:{n_params} vocab_size:{args.vocab_size} "
+        f"stem:{args.stem_layers} n_loops:{args.n_loops} crown:{args.crown_layers} workspace_tokens:{args.workspace_tokens} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
@@ -941,8 +1037,8 @@ def main() -> None:
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
+        f"linear_weight:{model.stem[0].attn.c_q.weight.dtype} "
+        f"skip_weight:{model.skip_weight.dtype}"
     )
 
     # ==============================================================================
