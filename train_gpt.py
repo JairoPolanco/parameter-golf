@@ -612,12 +612,17 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if attn_mask is not None:
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask.to(dtype=q.dtype),
-                is_causal=False,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            )
+            # FlashAttention only supports is_causal=True or no mask.
+            # For the workspace mask, fall back to manual matmul attention.
+            if self.num_kv_heads != self.num_heads:
+                repeat = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+            scale = self.head_dim ** -0.5
+            attn_w = torch.matmul(q, k.transpose(-2, -1)) * scale
+            attn_w = attn_w + attn_mask.to(dtype=attn_w.dtype)
+            attn_w = torch.softmax(attn_w.float(), dim=-1).to(dtype=q.dtype)
+            y = torch.matmul(attn_w, v)
         else:
             y = F.scaled_dot_product_attention(
                 q, k, v,
